@@ -111,24 +111,16 @@ async function ocrSpace(imageUrl: string, engine: string, key: string): Promise<
     finally { if (timer) clearTimeout(timer); }
 }
 
-function lineToText(words: OcrWord[]): { text: string; words: string[] } {
-    const ws = (words || [])
-        .filter(w => w && typeof w.WordText === "string" && w.WordText.trim())
-        .slice()
-        .sort((a, b) => (b.Left || 0) - (a.Left || 0));
-    if (!ws.length) return { text: "", words: [] };
-    const hs = ws.map(w => w.Height || 0).filter(h => h > 0);
-    const lineH = hs.length ? hs.reduce((a, b) => a + b, 0) / hs.length : 20;
-    let out = ws[0].WordText!.trim();
-    const kept = [ws[0].WordText!.trim()];
-    for (let i = 1; i < ws.length; i++) {
-        const prev = ws[i - 1], cur = ws[i];
-        const gap = (prev.Left || 0) - ((cur.Left || 0) + (cur.Width || 0));
-        const sep = gap > lineH * 0.12 ? " " : "";
-        out += sep + cur.WordText!.trim();
-        kept.push(cur.WordText!.trim());
-    }
-    return { text: out, words: kept };
+interface OcrWordGeo { t: string; n: string; l: number; tp: number; h: number; w: number; }
+
+// Row-level UI detection: a visual row that carries game chrome (mode label,
+// countdown, instruction text) is dropped as a whole — its leftover words can
+// never become the answer. Answer rows keep only real content words.
+function isUiRow(jn: string, js: string): boolean {
+    if (/تفكيك|فكك/.test(jn)) return true;
+    if (/اسرع/.test(jn) && /يكتب/.test(jn)) return true;
+    if (COUNTDOWN_RE.test(js) || /\d+\s*(ثانيه|ثواني)/.test(js)) return true;
+    return false;
 }
 
 function parseOcrResult(json: OcrResultJson | null): OcrResult {
@@ -136,36 +128,86 @@ function parseOcrResult(json: OcrResultJson | null): OcrResult {
     const parsed = json && json.ParsedResults && json.ParsedResults[0];
     if (!parsed) return res;
     const lines = (parsed.TextOverlay && parsed.TextOverlay.Lines) || [];
-    const rawLines: { text: string; norm: string; minTop: number; words: string[] }[] = [];
+
+    // Collect every Arabic word with its on-image geometry.
+    const allW: OcrWordGeo[] = [];
     for (const line of lines) {
-        const lt = lineToText(line.Words || []);
-        const clean = lt.text.replace(/[‎‏‪-‮]/g, "").trim();
-        if (!clean || !hasArabic(clean)) continue;
-        rawLines.push({ text: clean, norm: arNorm(clean), minTop: line.MinTop || 0, words: lt.words });
+        for (const wd of (line.Words || [])) {
+            const t = (wd.WordText || "").replace(/[‎‏‪-‮]/g, "").trim();
+            if (!t || !hasArabic(t)) continue;
+            allW.push({
+                t,
+                n: arNorm(t),
+                l: wd.Left || 0,
+                tp: wd.Top || 0,
+                h: wd.Height || 0,
+                w: wd.Width || 0,
+            });
+        }
     }
-    if (!rawLines.length) return res;
+    if (!allW.length) return res;
 
-    const joined = rawLines.map(l => l.norm).join(" ");
-    res.mode = detectMode(joined);
-    res.countdown = COUNTDOWN_RE.test(joined) || /\d+\s*(ثانيه|ثواني)/.test(joined);
+    // Arabic reading order: top-to-bottom rows, right-to-left inside a row.
+    const reading = allW.slice().sort((a, b) => a.tp - b.tp || b.l - a.l);
+    const joinedN = reading.map(w => w.n).join("");
+    const joinedSp = reading.map(w => w.n).join(" ");
+    res.mode = detectMode(joinedN);
+    res.countdown = COUNTDOWN_RE.test(joinedSp) || /\d+\s*(ثانيه|ثواني)/.test(joinedSp);
 
-    const candidates: { key: string; disp: string; score: number; top: number }[] = [];
-    for (const l of rawLines) {
-        const content = l.words.filter(w => {
-            const n = arNorm(w);
-            return n.length >= 2 && AR_LETTER.test(w) && !isStopWord(w);
+    // Cluster words into visual rows by vertical position.
+    const hs = allW.map(w => w.h).filter(h => h > 0).sort((a, b) => a - b);
+    const medH = hs.length ? hs[Math.floor(hs.length / 2)] : 20;
+    const tol = Math.max(6, medH * 0.55);
+    const rows: { top: number; words: OcrWordGeo[] }[] = [];
+    for (const w of reading) {
+        const last = rows[rows.length - 1];
+        if (last && Math.abs(w.tp - last.top) <= tol) last.words.push(w);
+        else rows.push({ top: w.tp, words: [w] });
+    }
+
+    interface Cand { key: string; disp: string; score: number; }
+    const cands: Cand[] = [];
+    const letterRows: OcrWordGeo[][] = [];
+
+    for (const row of rows) {
+        const jn = row.words.map(w => w.n).join("");
+        const js = row.words.map(w => w.n).join(" ");
+        if (isUiRow(jn, js)) continue;
+        // Row must contain at least one plausible answer word to survive.
+        const hasContent = row.words.some(w =>
+            w.n.length > 0 && AR_LETTER.test(w.t) && !isStopWord(w.t) && !isBadWord(w.t));
+        if (!hasContent) continue;
+
+        const kept = row.words.filter(w => {
+            if (!w.n.length || !AR_LETTER.test(w.t)) return false;
+            if (res.mode !== "tafkeek" && w.n.length < 2) return false;
+            if (isStopWord(w.t) || isBadWord(w.t)) return false;
+            return true;
         });
-        if (!content.length) continue;
-        if (content.some(w => isBadWord(w))) continue;
-        if (l.words.every(w => isStopWord(w) || !AR_LETTER.test(w))) continue;
-        const disp = content.join(" ");
+        if (!kept.length) continue;
+        const ordered = kept.slice().sort((a, b) => b.l - a.l);
+        const disp = ordered.map(w => w.t).join(" ");
         const key = arNorm(disp);
         if (key.length < 2) continue;
-        candidates.push({ key, disp, score: content.length * 10 - l.words.length, top: l.minTop });
+        const avgH = kept.reduce((s, w) => s + w.h, 0) / kept.length;
+        const chars = disp.replace(/\s/g, "").length;
+        cands.push({ key, disp, score: kept.length * 15 + avgH * 2 + chars * 2 });
+        const singles = kept.filter(w => w.n.length <= 1).length;
+        if (kept.length >= 2 && singles / kept.length >= 0.6) letterRows.push(kept);
     }
-    if (candidates.length) {
-        candidates.sort((a, b) => b.score - a.score || a.top - b.top);
-        res.answer = { key: candidates[0].key, disp: candidates[0].disp };
+
+    // tafkeek: letters may be laid out in a grid across several rows —
+    // merge every letter-heavy row into one candidate in reading order.
+    if (res.mode === "tafkeek" && letterRows.length) {
+        const all = letterRows.flat().sort((a, b) => a.tp - b.tp || b.l - a.l);
+        const disp = all.map(w => w.t).join(" ");
+        const key = arNorm(disp);
+        if (key.length >= 2) cands.push({ key, disp, score: all.length * 30 + 60 });
+    }
+
+    if (cands.length) {
+        cands.sort((a, b) => b.score - a.score);
+        res.answer = { key: cands[0].key, disp: cands[0].disp };
     }
     return res;
 }
@@ -204,8 +246,8 @@ function saveCfg() { storage.cfg = JSON.parse(JSON.stringify(storage.cfg || {}))
 
 function selectedChannelId(): string | null {
     try {
-        const s = findByStoreName("SelectedChannelStore");
-        return (s && s.getChannelId && s.getChannelId()) || null;
+        stores();
+        return call0(_scs, "getChannelId") || null;
     } catch { return null; }
 }
 
@@ -290,6 +332,11 @@ function finishAnswer(r: OcrResult, channelId: string): void {
                 void ipcRequest("clear", {}, 4000);
             }, ms);
         } else {
+            // No usable composer — still show the on-screen keyboard typing
+            // the answer letter by letter, then deliver the message.
+            const spd = channelCfg(channelId)?.cfg.speed === "insane" ? "insane" : "normal";
+            try { await ipcRequest("animate", { text: answer.content, speed: spd }, 15000); }
+            catch { /* keyboard is cosmetic — send anyway */ }
             setTimeout(() => sendIt(), 20 + Math.floor(Math.random() * 60));
         }
     })();
@@ -334,17 +381,33 @@ async function processImage(channelId: string, imageUrl: string, insane: boolean
     if (solo.length === 1) finish(solo[0]);
 }
 
+// findByStoreName may return the store itself or nested module wrappers —
+// unwrap named/default exports until we reach something callable.
+function resolveStore(name: string): any {
+    try {
+        let s = findByStoreName(name);
+        for (let i = 0; i < 4 && s; i++) {
+            if (typeof s !== "object" && typeof s !== "function") break;
+            const inner = (s as any)[name] || (s as any).default;
+            if (!inner || inner === s) break;
+            s = inner;
+        }
+        return s;
+    } catch { return null; }
+}
+
 // ---------- Discord stores (resolved lazily, retried until Metro is ready) ----------
 
-let _gs: any, _cs: any, _ms: any, _storesAt = 0;
+let _gs: any, _cs: any, _ms: any, _scs: any, _storesAt = 0;
 function stores() {
     if (_gs && _cs && _ms) return;
     const now = Date.now();
     if (now - _storesAt < 2000) return;
     _storesAt = now;
-    if (!_gs) { try { _gs = findByStoreName("GuildStore"); } catch { /* not ready */ } }
-    if (!_cs) { try { _cs = findByStoreName("ChannelStore"); } catch { /* not ready */ } }
-    if (!_ms) { try { _ms = findByStoreName("GuildMemberStore"); } catch { /* not ready */ } }
+    if (!_gs) _gs = resolveStore("GuildStore");
+    if (!_cs) _cs = resolveStore("ChannelStore");
+    if (!_ms) _ms = resolveStore("GuildMemberStore");
+    if (!_scs) _scs = resolveStore("SelectedChannelStore");
 }
 
 function call0(obj: any, name: string, arg?: any): any {

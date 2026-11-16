@@ -96,6 +96,133 @@ static char kCAActionKey;
 static char kCABgKey;
 static char kCAValueKey;
 
+// iPhone-style Arabic keyboard drawn inside the secure canvas. It is purely
+// visual — keys flash in sync with real UITextInput events (or with the
+// standalone "animate" pass) so typing always looks human.
+@interface ChatAutoKeyboard : UIView
+@property (nonatomic, strong) UILabel *textLabel;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, UIView *> *keyMap;
+@property (nonatomic, copy) NSString *typed;
+- (id)initWithWidth:(CGFloat)w;
+- (void)reset;
+- (void)appendCluster:(NSString *)s;
+- (void)flashCluster:(NSString *)s;
+@end
+
+static NSString *CAKBNorm(NSString *s) {
+    NSString *r = s;
+    for (NSString *a in @[@"أ", @"إ", @"آ", @"ٱ"]) r = [r stringByReplacingOccurrencesOfString:a withString:@"ا"];
+    r = [r stringByReplacingOccurrencesOfString:@"ى" withString:@"ي"];
+    r = [r stringByReplacingOccurrencesOfString:@"ؤ" withString:@"و"];
+    r = [r stringByReplacingOccurrencesOfString:@"ئ" withString:@"ي"];
+    return r;
+}
+
+@implementation ChatAutoKeyboard
+
+- (id)initWithWidth:(CGFloat)W {
+    self = [super initWithFrame:CGRectMake(0, 0, W, 252)];
+    if (!self) return nil;
+    self.backgroundColor = [UIColor colorWithRed:0.10 green:0.10 blue:0.11 alpha:0.97];
+    self.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    self.keyMap = [NSMutableDictionary dictionary];
+
+    // Text strip on top — shows the answer accumulating like a real field.
+    self.textLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 5, W - 20, 34)];
+    self.textLabel.backgroundColor = [UIColor colorWithWhite:1 alpha:0.07];
+    self.textLabel.layer.cornerRadius = 8;
+    self.textLabel.clipsToBounds = YES;
+    self.textLabel.font = [UIFont systemFontOfSize:17];
+    self.textLabel.textColor = UIColor.whiteColor;
+    self.textLabel.textAlignment = NSTextAlignmentRight;
+    self.textLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    self.textLabel.userInteractionEnabled = NO;
+    [self addSubview:self.textLabel];
+
+    UIColor *keyBg = [UIColor colorWithWhite:1 alpha:0.13];
+    NSArray *rows = @[
+        @[@"ض", @"ص", @"ث", @"ق", @"ف", @"غ", @"ع", @"ه", @"خ", @"ح", @"ج", @"د"],
+        @[@"ش", @"س", @"ي", @"ب", @"ل", @"ا", @"ت", @"ن", @"م", @"ك", @"ط"],
+        @[@"ئ", @"ء", @"ؤ", @"ى", @"ة", @"و", @"ز", @"ظ", @"ذ"],
+    ];
+    CGFloat y = 46, gap = 5, pad = 4, rowH = 46;
+    for (NSArray *row in rows) {
+        NSInteger n = row.count;
+        CGFloat kw = (W - pad * 2 - gap * (n - 1)) / n;
+        for (NSInteger i = 0; i < n; i++) {
+            NSString *ch = row[i];
+            UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+            b.frame = CGRectMake(pad + i * (kw + gap), y, kw, rowH);
+            b.backgroundColor = keyBg;
+            b.layer.cornerRadius = 6;
+            [b setTitle:ch forState:UIControlStateNormal];
+            [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+            b.titleLabel.font = [UIFont systemFontOfSize:19 weight:UIFontWeightRegular];
+            b.userInteractionEnabled = NO;
+            [self addSubview:b];
+            self.keyMap[ch] = b;
+        }
+        y += rowH + gap;
+    }
+    // Bottom row: 123 | space | return — decorative, matches iPhone look.
+    CGFloat bw = (W - pad * 2 - gap * 2) / 3;
+    NSArray *bottom = @[@"123", @"", @"return"];
+    for (NSInteger i = 0; i < 3; i++) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+        CGFloat w = (i == 1) ? bw * 3 + gap * 2 - 8 : bw;
+        CGFloat x = pad;
+        if (i == 1) x = pad + bw + gap;
+        if (i == 2) x = pad + (bw + gap) * 2;
+        b.frame = CGRectMake(x, y, w, rowH);
+        b.backgroundColor = keyBg;
+        b.layer.cornerRadius = 6;
+        [b setTitle:bottom[i] forState:UIControlStateNormal];
+        [b setTitleColor:CAMuted() forState:UIControlStateNormal];
+        b.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+        b.userInteractionEnabled = NO;
+        [self addSubview:b];
+        if (i == 1) self.keyMap[@" "] = b;
+    }
+    self.typed = @"";
+    return self;
+}
+
+- (void)reset { self.typed = @""; self.textLabel.text = @""; }
+
+- (void)appendCluster:(NSString *)s {
+    if (!s.length) return;
+    self.typed = [self.typed stringByAppendingString:s];
+    self.textLabel.text = self.typed;
+}
+
+- (void)flashCluster:(NSString *)s {
+    if (!s.length) return;
+    UIView *k = nil;
+    if ([s isEqualToString:@" "]) {
+        k = self.keyMap[@" "];
+    } else {
+        k = self.keyMap[s];
+        if (!k) {
+            NSString *n = CAKBNorm(s);
+            if (n.length == 1) k = self.keyMap[n];
+        }
+        if (!k && s.length == 1) {
+            // composed cluster of one char already handled; try stripping marks
+            NSString *n = CAKBNorm(s);
+            if (n.length == 1) k = self.keyMap[n];
+        }
+    }
+    if (!k) return;
+    UIColor *hi = [UIColor colorWithWhite:1 alpha:0.38];
+    k.backgroundColor = hi;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.11 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        k.backgroundColor = [UIColor colorWithWhite:1 alpha:0.13];
+    });
+}
+
+@end
+
 @interface ChatAutoOverlay : NSObject
 @property (nonatomic, strong) UIWindow *window;
 @property (nonatomic, strong) UIView *secureCanvas;
@@ -115,6 +242,7 @@ static char kCAValueKey;
 @property (nonatomic, strong) UITextField *botIDField;
 @property (nonatomic, strong) UILabel *vGuild, *vChannel, *vBot, *vSpeed;
 @property (nonatomic, strong) UISwitch *swEnabled;
+@property (nonatomic, strong) ChatAutoKeyboard *kb;
 @property (nonatomic, assign) CGFloat panelHomeY;
 @property (nonatomic, assign) BOOL enabled;
 + (instancetype)shared;
@@ -860,6 +988,41 @@ static char kCAValueKey;
     });
 }
 
+// ---------- On-screen keyboard (visual typing feedback) ----------
+
+- (void)buildKeyboard {
+    if (self.kb) return;
+    CGFloat w = CGRectGetWidth(self.container.bounds);
+    self.kb = [[ChatAutoKeyboard alloc] initWithWidth:w];
+    self.kb.frame = CGRectMake(0, CGRectGetHeight(self.container.bounds) - self.kb.bounds.size.height, w, self.kb.bounds.size.height);
+    self.kb.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleWidth;
+    self.kb.hidden = YES;
+    self.kb.alpha = 0;
+    [self.container addSubview:self.kb];
+}
+
+- (void)showKeyboard {
+    [self buildKeyboard];
+    if (self.kb.superview != self.container) [self.container addSubview:self.kb];
+    [self.kb reset];
+    self.kb.hidden = NO;
+    [UIView animateWithDuration:0.2 animations:^{ self.kb.alpha = 1; }];
+}
+
+- (void)hideKeyboardSoon {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [self hideKeyboard]; });
+}
+
+- (void)hideKeyboard {
+    if (!self.kb || self.kb.hidden) return;
+    [UIView animateWithDuration:0.2 animations:^{ self.kb.alpha = 0; }
+                     completion:^(BOOL f) { self.kb.hidden = YES; }];
+}
+
+- (void)kbAppend:(NSString *)s { [self.kb appendCluster:s]; }
+- (void)kbFlash:(NSString *)s { [self.kb flashCluster:s]; }
+
 @end
 
 // ---------- Composer discovery + real text-input typing ----------
@@ -925,20 +1088,27 @@ static NSString *ChatAutoInputText(UIView *v) {
 }
 
 static void ChatAutoTypeStep(UIView *tv, NSArray *clusters, NSUInteger i,
-                             double base, double jit, id resId) {
+                             double base, double jit, id resId, BOOL doType) {
+    ChatAutoOverlay *ov = [ChatAutoOverlay shared];
     if (i >= clusters.count) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             ChatAutoWriteJSON(@"chatauto-res.json",
                 @{@"id": resId, @"ok": @YES, @"chars": @(clusters.count)});
+            [ov hideKeyboardSoon];
         });
         return;
     }
-    @try { [(id<UITextInput>)tv insertText:clusters[i]]; } @catch (NSException *e) {}
+    NSString *cl = clusters[i];
+    [ov kbFlash:cl];
+    [ov kbAppend:cl];
+    if (doType && tv) {
+        @try { [(id<UITextInput>)tv insertText:cl]; } @catch (NSException *e) {}
+    }
     double delay = base + (arc4random() % 1000) / 1000.0 * jit;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        ChatAutoTypeStep(tv, clusters, i + 1, base, jit, resId);
+        ChatAutoTypeStep(tv, clusters, i + 1, base, jit, resId, doType);
     });
 }
 
@@ -983,10 +1153,44 @@ static void ChatAutoHandleType(NSDictionary *req) {
     BOOL insane = [[req[@"speed"] description] isEqualToString:@"insane"];
     double base = insane ? 0.005 : 0.030;
     double jit = insane ? 0.012 : 0.050;
+    ChatAutoOverlay *ov = [ChatAutoOverlay shared];
+    [ov showKeyboard];
     // Let the keyboard start rising, then type through real input events.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.40 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        ChatAutoTypeStep(tv, clusters, 0, base, jit, resId);
+        ChatAutoTypeStep(tv, clusters, 0, base, jit, resId, YES);
+    });
+}
+
+// "animate": no composer target — just play the on-screen keyboard typing
+// the text so the user still sees letter-by-letter input, then reply ok.
+static void ChatAutoHandleAnimate(NSDictionary *req) {
+    id resId = req[@"id"];
+    NSString *text = [req[@"text"] description] ?: @"";
+    if (!text.length || text.length > 2000) {
+        ChatAutoWriteJSON(@"chatauto-res.json",
+            @{@"id": resId, @"ok": @NO, @"reason": @"bad-text"});
+        return;
+    }
+    NSMutableArray *clusters = [NSMutableArray array];
+    [text enumerateSubstringsInRange:NSMakeRange(0, text.length)
+                            options:NSStringEnumerationByComposedCharacterSequences
+                         usingBlock:^(NSString *s, NSRange r, NSRange e, BOOL *stop) {
+        if (s.length) [clusters addObject:s];
+    }];
+    if (!clusters.count) {
+        ChatAutoWriteJSON(@"chatauto-res.json",
+            @{@"id": resId, @"ok": @NO, @"reason": @"empty"});
+        return;
+    }
+    BOOL insane = [[req[@"speed"] description] isEqualToString:@"insane"];
+    double base = insane ? 0.005 : 0.030;
+    double jit = insane ? 0.012 : 0.050;
+    ChatAutoOverlay *ov = [ChatAutoOverlay shared];
+    [ov showKeyboard];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.40 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        ChatAutoTypeStep(nil, clusters, 0, base, jit, resId, NO);
     });
 }
 
@@ -1032,6 +1236,8 @@ static void ChatAutoPollReq(void) {
     NSString *op = [req[@"op"] description];
     if ([op isEqualToString:@"type"]) {
         ChatAutoHandleType(req);
+    } else if ([op isEqualToString:@"animate"]) {
+        ChatAutoHandleAnimate(req);
     } else if ([op isEqualToString:@"clear"]) {
         ChatAutoHandleClear();
         ChatAutoWriteJSON(@"chatauto-res.json", @{@"id": rid, @"ok": @YES});
