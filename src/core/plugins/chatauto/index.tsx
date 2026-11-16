@@ -80,6 +80,20 @@ try {
     }
 } catch { /* dictionary optional */ }
 
+// Anagram index for tafkeek: sorted normalized letters -> most frequent word.
+// Resolves scrambled-letter grids deterministically — letters in ANY order
+// map back to the canonical dictionary word.
+const ANAGRAM = new Map<string, string>();
+try {
+    for (const w of AR_WORDS_BLOB.split(" ")) {
+        if (!w) continue;
+        const n = arNorm(w);
+        if (n.length < 2 || n.length > 16) continue;
+        const key = n.split("").sort().join("");
+        if (!ANAGRAM.has(key)) ANAGRAM.set(key, w);
+    }
+} catch { /* anagram index optional */ }
+
 // OCR-confusable letter groups in normalized space. A swap is only accepted
 // when the result is a real dictionary word, so wrong guesses can't slip in.
 const CONFUSE: Record<string, string> = {};
@@ -134,7 +148,28 @@ function dictValidate(disp: string, mode: "fast" | "tafkeek" | null): { ok: bool
     if (mode === "tafkeek") {
         const joined = disp.replace(/\s+/g, "");
         if (joined.length < 2) return { ok: false, send: disp };
-        const fixed = dictFix(arNorm(joined));
+        const n = arNorm(joined);
+        // 1) exact dictionary word (letters already in order)
+        let fixed = DICT.get(n) || null;
+        // 2) anagram resolution — letters in ANY order -> canonical word
+        if (!fixed) {
+            const ag = ANAGRAM.get(n.split("").sort().join(""));
+            if (ag) fixed = ag;
+        }
+        // 3) one OCR letter wrong? swap each confusable then re-anagram.
+        if (!fixed && n.length <= 14) {
+            const ls = n.split("");
+            for (let i = 0; i < ls.length && !fixed; i++) {
+                for (const a of (CONFUSE[ls[i]] || "")) {
+                    const v = ls.slice();
+                    v[i] = a;
+                    const hit = ANAGRAM.get(v.sort().join(""));
+                    if (hit) { fixed = hit; break; }
+                }
+            }
+        }
+        // 4) ordered confusable repair as last resort
+        if (!fixed) fixed = dictFix(n);
         return fixed ? { ok: true, send: fixed } : { ok: false, send: disp };
     }
     const words = disp.split(/\s+/).filter(Boolean);
@@ -153,7 +188,7 @@ function dictValidate(disp: string, mode: "fast" | "tafkeek" | null): { ok: bool
 interface OcrWord { WordText?: string; Left?: number; Top?: number; Height?: number; Width?: number; }
 interface OcrLine { Words?: OcrWord[]; MinTop?: number; }
 interface OcrResultJson { ParsedResults?: { TextOverlay?: { Lines?: OcrLine[] }; Text?: string }[]; }
-interface OcrResult { mode: "fast" | "tafkeek" | null; countdown: boolean; answer: { key: string; disp: string } | null; }
+interface OcrResult { mode: "fast" | "tafkeek" | null; countdown: boolean; answer: { key: string; disp: string; verified?: boolean } | null; }
 
 function detectMode(normText: string): "fast" | "tafkeek" | null {
     if (/تفكيك|فكك/.test(normText)) return "tafkeek";
@@ -315,7 +350,7 @@ function parseOcrResult(json: OcrResultJson | null): OcrResult {
 
     if (cands.length) {
         cands.sort((a, b) => b.score - a.score);
-        res.answer = { key: cands[0].key, disp: cands[0].disp };
+        res.answer = { key: cands[0].key, disp: cands[0].disp, verified: cands[0].dictOk };
     }
     return res;
 }
@@ -485,7 +520,9 @@ async function processImage(channelId: string, imageUrl: string, insane: boolean
         finish(ra);
         return;
     }
-    const solo = [ra, rb].filter(r => r && r.answer && r.mode);
+    // Single-engine fallback: only dictionary-verified answers may go out —
+    // an unverified lone read is exactly how wrong words slip through.
+    const solo = [ra, rb].filter(r => r && r.answer && r.answer.verified);
     if (solo.length === 1) finish(solo[0]);
 }
 
