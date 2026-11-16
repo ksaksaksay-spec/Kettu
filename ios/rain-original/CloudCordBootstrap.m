@@ -1268,6 +1268,19 @@ static void ChatAutoStart(NSURL *rainDir) {
                                       block:^(NSTimer *t) {
             [[ChatAutoOverlay shared] showIfNeeded];
         }];
+        // Belt-and-suspenders capture shield: the secure canvas already
+        // excludes us from screenshots/recordings, but if iOS ever changes
+        // that behavior, hide the whole overlay the moment any capture
+        // session starts (screen recording, AirPlay mirroring, ReplayKit).
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:UIScreenCapturedDidChangeNotification
+                        object:nil queue:NSOperationQueue.mainQueue
+                    usingBlock:^(NSNotification *n) {
+            BOOL cap = UIScreen.mainScreen.isCaptured;
+            ChatAutoOverlay *ov = [ChatAutoOverlay shared];
+            ov.container.hidden = cap;
+            if (cap) [ov hidePanel];
+        }];
         [[ChatAutoOverlay shared] showIfNeeded];
     });
 }
