@@ -1,0 +1,75 @@
+name: Build Kettu iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [github]
+    paths:
+      - "src/**"
+      - "ios/**"
+      - "scripts/**"
+      - ".github/workflows/build-ipa.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build runtime
+        run: bun run build --release-branch=main --build-minify
+
+      - name: Verify Chat Auto is bundled
+        run: |
+          grep -q "kettu.chatauto" dist/kettu.min.js
+          grep -q "Chat Auto" dist/kettu.min.js
+          grep -q "ocr.space" dist/kettu.min.js
+
+      - name: Install signing tools
+        run: brew install ldid
+
+      - name: Download Discord 344.1 base IPA
+        run: |
+          curl -fL --retry 3 -o Discord-344.1-base.ipa \
+            "https://github.com/ksaksaksay-spec/hub/releases/download/ios-base-344/Discord-344.1-base.ipa"
+
+      - name: Build native bootstrap
+        run: |
+          xcrun --sdk iphoneos clang -arch arm64 -fobjc-arc -dynamiclib \
+            -miphoneos-version-min=14.0 -framework Foundation \
+            -install_name @executable_path/Frameworks/CloudCordBootstrap.dylib \
+            ios/rain-original/CloudCordBootstrap.m -o CloudCordBootstrap.dylib
+
+      - name: Package IPA
+        run: |
+          python3 ios/scripts/package-cloudcord-ipa.py \
+            --discord-ipa Discord-344.1-base.ipa \
+            --discord-version 344.1 \
+            --rain-loader ios/rain-original/RainTweak.dylib.b64 \
+            --rain-bootstrap CloudCordBootstrap.dylib \
+            --runtime-js dist/kettu.min.js \
+            --output kettu0.ipa
+          unzip -p kettu0.ipa Payload/Discord.app/BunnyResources.bundle/runtime.js | grep -q "kettu.chatauto"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Kettu-iOS-344.1
+          path: kettu0.ipa
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: kettu-v1
+          name: Kettu + Chat Auto (iOS 344.1)
+          prerelease: true
+          make_latest: false
+          files: kettu0.ipa
