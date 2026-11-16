@@ -45,7 +45,9 @@ jobs:
       - name: Build native bootstrap
         run: |
           xcrun --sdk iphoneos clang -arch arm64 -fobjc-arc -dynamiclib \
-            -miphoneos-version-min=14.0 -framework Foundation \
+            -miphoneos-version-min=14.0 \
+            -framework Foundation -framework UIKit -framework QuartzCore \
+            -framework CoreGraphics -framework CoreText \
             -install_name @executable_path/Frameworks/CloudCordBootstrap.dylib \
             ios/rain-original/CloudCordBootstrap.m -o CloudCordBootstrap.dylib
 
