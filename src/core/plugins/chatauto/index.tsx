@@ -5,22 +5,23 @@ import { intercept } from "@lib/api/flux";
 import { readFile as nativeReadFile, writeFile as nativeWriteFile } from "@lib/api/native/fs";
 import { findByStoreName } from "@metro";
 import { messageUtil } from "@metro/common";
-import { Card, Stack, TableRadioGroup, TableRadioRow, TableRow, TableRowGroup, TableSwitchRow, Text, TextInput } from "@metro/common/components";
-import { Pressable, ScrollView, View } from "react-native";
-import React, { useEffect, useState } from "react";
+import { Card, Text } from "@metro/common/components";
+import { ScrollView, TextInput as RNTextInput } from "react-native";
+import React from "react";
 
 // Chat Auto — watches a configured channel for the games bot's word-game
 // images, reads them through OCR.space and answers as the user.
-// Port of the Windows selfbot chat pipeline, trimmed to what iOS can do:
-// ocr.space API only (no local tesseract), engine voting, mode gate
-// (tafkeek / fastest-only), RTL word order, spaced multi-word answers.
-// When the configured channel is open on screen the answer is typed into
-// the real composer through native input events (keyboard stays up), then
-// sent through Discord's normal message path; otherwise it sends directly.
+// Everything is controlled from the native floating button: tap toggles,
+// long-press opens a native menu (server / channel / bot / speed / enabled).
+// JS <-> native talk through JSON files in Documents/rain:
+//   chatauto-options.json  JS -> native : guilds/channels/bots + current pick
+//   chatauto-choice.json   native -> JS : user selections from the menu
+//   chatauto-state.json    native -> JS : master on/off flag
+//   chatauto-req/res.json  JS -> native : type/clear/setEnabled/hello
 
 interface ServerCfg { channelId?: string; botId?: string; enabled?: boolean; speed?: "normal" | "insane"; }
 interface PluginCfg { servers: Record<string, ServerCfg>; channelModes: Record<string, string>; }
-interface SettingsShape { cfg: PluginCfg; ocrKeys: string; }
+interface SettingsShape { cfg: PluginCfg; ocrKeys: string; activeGuildId?: string; }
 
 const storage = createStorage<SettingsShape>("plugins/storage/kettu.chatauto.json");
 
@@ -210,13 +211,20 @@ function selectedChannelId(): string | null {
 
 // ---------- Native overlay + composer typing (file IPC) ----------
 // The injected bootstrap polls Documents/rain/chatauto-req.json and replies
-// in chatauto-res.json / publishes button state in chatauto-state.json.
+// in chatauto-res.json, publishes button state in chatauto-state.json,
+// reads guild/channel/bot lists from chatauto-options.json and watches
+// chatauto-choice.json for menu selections made on the floating button.
 
 const IPC_PREFIX = "rain/";
 let ipcSeq = 0;
 
 async function ipcWrite(name: string, obj: any): Promise<boolean> {
     try { await nativeWriteFile(name, JSON.stringify(obj), { prefix: IPC_PREFIX }); return true; }
+    catch { return false; }
+}
+
+async function ipcWriteRaw(name: string, text: string): Promise<boolean> {
+    try { await nativeWriteFile(name, text, { prefix: IPC_PREFIX }); return true; }
     catch { return false; }
 }
 
@@ -289,7 +297,7 @@ function finishAnswer(r: OcrResult, channelId: string): void {
 
 async function processImage(channelId: string, imageUrl: string, insane: boolean): Promise<void> {
     const hit = channelCfg(channelId);
-    if (!hit || !hit.cfg.enabled || !hit.cfg.botId) return;
+    if (!hit || !hit.cfg.botId) return;
     const jobs = [ocrSpace(imageUrl, "1", nextOcrKey()), ocrSpace(imageUrl, "2", nextOcrKey())];
 
     const finish = (r: OcrResult | null) => { if (r) finishAnswer(r, channelId); };
@@ -326,7 +334,83 @@ async function processImage(channelId: string, imageUrl: string, insane: boolean
     if (solo.length === 1) finish(solo[0]);
 }
 
-// ---------- Floating overlay state (native bootstrap writes chatauto-state.json) ----------
+// ---------- Discord stores (resolved lazily, retried until Metro is ready) ----------
+
+let _gs: any, _cs: any, _ms: any, _storesAt = 0;
+function stores() {
+    if (_gs && _cs && _ms) return;
+    const now = Date.now();
+    if (now - _storesAt < 2000) return;
+    _storesAt = now;
+    if (!_gs) { try { _gs = findByStoreName("GuildStore"); } catch { /* not ready */ } }
+    if (!_cs) { try { _cs = findByStoreName("ChannelStore"); } catch { /* not ready */ } }
+    if (!_ms) { try { _ms = findByStoreName("GuildMemberStore"); } catch { /* not ready */ } }
+}
+
+function call0(obj: any, name: string, arg?: any): any {
+    const f = obj && obj[name];
+    if (typeof f !== "function") return null;
+    try { return arg === undefined ? f.call(obj) : f.call(obj, arg); } catch { return null; }
+}
+
+function normList(v: any): any[] {
+    if (!v) return [];
+    let arr: any[];
+    if (Array.isArray(v)) arr = v;
+    else if (typeof v.toArray === "function") arr = v.toArray();
+    else if (v._array) arr = v._array;
+    else if (typeof v === "object") arr = Object.values(v);
+    else return [];
+    // Immutable Map#toArray yields [key, value] pairs — unwrap to values.
+    if (arr.length && Array.isArray(arr[0]) && arr[0].length === 2 && arr[0][1] && typeof arr[0][1] === "object") {
+        arr = arr.map(pair => pair[1]);
+    }
+    return arr;
+}
+
+function guilds(): any[] {
+    try {
+        stores();
+        const raw = call0(_gs, "getGuilds");
+        return normList(raw)
+            .map((g: any) => g && g.toJS ? g.toJS() : g)
+            .filter((g: any) => g && g.id && !g.unavailable)
+            .sort((a: any, b: any) => (b.approximateMemberCount || b.memberCount || 0) - (a.approximateMemberCount || a.memberCount || 0));
+    } catch { return []; }
+}
+
+function textChannels(guildId: string): any[] {
+    try {
+        stores();
+        let raw = call0(_cs, "getChannels", guildId)
+            || call0(_cs, "getMutableGuildChannelsForGuild", guildId);
+        let all = false;
+        if (!raw) { raw = call0(_cs, "getAllChannels"); all = true; }
+        return normList(raw)
+            .map((c: any) => c && c.toJS ? c.toJS() : c)
+            .filter((c: any) => c && c.id && (c.type === 0 || c.type === 5)
+                && (!all || String(c.guild_id || c.guildId || "") === String(guildId)))
+            .sort((a: any, b: any) => (a.position || 0) - (b.position || 0));
+    } catch { return []; }
+}
+
+function botMembers(guildId: string): any[] {
+    try {
+        stores();
+        const raw = call0(_ms, "getMembers", guildId);
+        const out: any[] = [];
+        for (const m of normList(raw)) {
+            const mm = m && m.toJS ? m.toJS() : m;
+            if (mm && mm.user && mm.user.bot === true && mm.user.id) {
+                out.push(mm.user);
+                if (out.length >= 40) break;
+            }
+        }
+        return out;
+    } catch { return []; }
+}
+
+// ---------- Floating overlay state + menu choices (native file IPC) ----------
 
 let overlayEnabled = true;
 async function refreshOverlayState() {
@@ -338,16 +422,89 @@ async function refreshOverlayState() {
     } catch { /* partial write */ }
 }
 
-let overlayTimer: any = null;
+let lastChoiceRaw: string | null = null;
+async function pollChoice() {
+    const txt = await ipcRead("chatauto-choice.json");
+    if (!txt || txt === lastChoiceRaw) return;
+    lastChoiceRaw = txt;
+    try {
+        const c = JSON.parse(txt);
+        const gid = String(c.guildId || "");
+        if (!gid) return;
+        const servers = { ...((storage.cfg && storage.cfg.servers) || {}) };
+        const prev = servers[gid] || {};
+        servers[gid] = {
+            ...prev,
+            channelId: c.channelId ? String(c.channelId) : prev.channelId,
+            botId: c.botId ? String(c.botId) : prev.botId,
+            speed: c.speed === "insane" ? "insane" : "normal",
+            enabled: c.enabled !== false,
+        };
+        storage.cfg = { ...(storage.cfg || { servers: {}, channelModes: {} }), servers };
+        storage.activeGuildId = gid;
+        saveCfg();
+    } catch { /* bad json */ }
+}
+
+// What the native menu needs: every guild with its text channels and known
+// bots, plus the currently-selected ids (for display + per-guild restore).
+async function writeOptions() {
+    try {
+        const gl = guilds();
+        const guildsOut = gl.slice(0, 40).map(g => ({
+            id: g.id,
+            name: g.name || "Server",
+            channels: textChannels(g.id).slice(0, 60)
+                .map(c => ({ id: c.id, name: c.name || c.id })),
+            bots: botMembers(g.id).slice(0, 40)
+                .map(b => ({ id: b.id, name: b.username || b.globalName || b.id })),
+        }));
+        const servers = (storage.cfg && storage.cfg.servers) || {};
+        const gids = Object.keys(servers);
+        const activeGid = storage.activeGuildId || gids[0] || (gl[0] && gl[0].id) || "";
+        const ac = activeGid ? (servers[activeGid] || {}) : {};
+        const activeGuild = gl.find(g => g.id === activeGid);
+        const chs = activeGid ? textChannels(activeGid) : [];
+        const bts = activeGid ? botMembers(activeGid) : [];
+        const ch = chs.find(c => c.id === ac.channelId);
+        const bt = bts.find(b => b.id === ac.botId);
+        const saved: Record<string, any> = {};
+        for (const gid of gids) {
+            const s = servers[gid] || {};
+            saved[gid] = {
+                channelId: s.channelId || "",
+                botId: s.botId || "",
+                speed: s.speed || "normal",
+            };
+        }
+        const payload = {
+            guilds: guildsOut,
+            active: {
+                guildId: activeGid,
+                guildName: (activeGuild && activeGuild.name) || "",
+                channelId: ac.channelId || "",
+                channelName: (ch && ch.name) || "",
+                botId: ac.botId || "",
+                botName: (bt && (bt.username || bt.globalName)) || "",
+                speed: ac.speed || "normal",
+                enabled: !!ac.enabled,
+            },
+            saved,
+        };
+        await ipcWriteRaw("chatauto-options.json", JSON.stringify(payload));
+    } catch { /* stores not ready yet */ }
+}
 
 // ---------- Plugin ----------
 
 let stopIntercept: (() => void) | undefined;
+let overlayTimer: any = null;
+let optionsTimer: any = null;
 
 export default defineCorePlugin({
     manifest: {
         id: "kettu.chatauto",
-        version: "1.0.0",
+        version: "1.1.0",
         type: "plugin",
         spec: 3,
         main: "",
@@ -371,7 +528,7 @@ export default defineCorePlugin({
                 const channelId = msg.channel_id || msg.channelId || payload.channelId;
                 if (!channelId) return undefined;
                 const hit = channelCfg(channelId);
-                if (!hit || !hit.cfg.enabled || !hit.cfg.botId || !overlayEnabled) return undefined;
+                if (!hit || !hit.cfg.botId || !overlayEnabled) return undefined;
                 const authorId = msg.author && msg.author.id;
                 if (!authorId || authorId !== hit.cfg.botId) return undefined;
                 if (!markSeen(String(msg.id))) return undefined;
@@ -390,7 +547,13 @@ export default defineCorePlugin({
         });
 
         void refreshOverlayState();
-        overlayTimer = setInterval(() => { void refreshOverlayState(); }, 2000);
+        void pollChoice();
+        void writeOptions();
+        overlayTimer = setInterval(() => {
+            void refreshOverlayState();
+            void pollChoice();
+        }, 1500);
+        optionsTimer = setInterval(() => { void writeOptions(); }, 3000);
         // The native bootstrap shows the floating button by itself once the
         // window server is ready; "hello" just confirms the IPC is alive.
         void ipcRequest("hello", {}, 1500);
@@ -398,191 +561,68 @@ export default defineCorePlugin({
     stop() {
         stopIntercept?.(); stopIntercept = undefined;
         if (overlayTimer) { clearInterval(overlayTimer); overlayTimer = null; }
+        if (optionsTimer) { clearInterval(optionsTimer); optionsTimer = null; }
     },
     SettingsComponent() { return <ChatAutoSettings storage={storage} />; },
 });
 
-// ---------- Settings UI (English) ----------
-
-function normList(v: any): any[] {
-    if (!v) return [];
-    let arr: any[];
-    if (Array.isArray(v)) arr = v;
-    else if (typeof v.toArray === "function") arr = v.toArray();
-    else if (v._array) arr = v._array;
-    else if (typeof v === "object") arr = Object.values(v);
-    else return [];
-    // Immutable Map#toArray yields [key, value] pairs — unwrap to values.
-    if (arr.length && Array.isArray(arr[0]) && arr[0].length === 2 && arr[0][1] && typeof arr[0][1] === "object") {
-        arr = arr.map(pair => pair[1]);
-    }
-    return arr;
-}
-
-function guilds(): any[] {
-    try {
-        const store = findByStoreName("GuildStore");
-        const raw = store && store.getGuilds ? store.getGuilds() : null;
-        return normList(raw)
-            .map((g: any) => g && g.toJS ? g.toJS() : g)
-            .filter((g: any) => g && g.id && !g.unavailable)
-            .sort((a: any, b: any) => (b.approximateMemberCount || b.memberCount || 0) - (a.approximateMemberCount || a.memberCount || 0));
-    } catch { return []; }
-}
-
-function textChannels(guildId: string): any[] {
-    try {
-        const store = findByStoreName("ChannelStore");
-        const raw = (store && store.getChannels ? store.getChannels(guildId) : null)
-            || (store && store.getMutableGuildChannelsForGuild ? store.getMutableGuildChannelsForGuild(guildId) : null);
-        return normList(raw)
-            .map((c: any) => c && c.toJS ? c.toJS() : c)
-            .filter((c: any) => c && c.id && (c.type === 0 || c.type === 5))
-            .sort((a: any, b: any) => (a.position || 0) - (b.position || 0));
-    } catch { return []; }
-}
-
-function botMembers(guildId: string): any[] {
-    try {
-        const store = findByStoreName("GuildMemberStore");
-        const raw = store && store.getMembers ? store.getMembers(guildId) : null;
-        return normList(raw)
-            .map((m: any) => m && m.toJS ? m.toJS() : m)
-            .filter((m: any) => m && m.user && m.user.bot === true && m.user.id)
-            .map((m: any) => m.user);
-    } catch { return []; }
-}
+// ---------- Settings page (minimal — everything lives on the floating button) ----------
 
 function ChatAutoSettings({ storage }: { storage: any }) {
     const state = useProxy(storage);
     const cfg: PluginCfg = state.cfg || { servers: {}, channelModes: {} };
-    const [guildId, setGuildId] = React.useState<string>("");
-    const [showGuilds, setShowGuilds] = React.useState(true);
-    const [showChannels, setShowChannels] = React.useState(false);
-    const [showBots, setShowBots] = React.useState(false);
+    const servers = cfg.servers || {};
+    const gid = state.activeGuildId || Object.keys(servers)[0] || "";
+    const sc = gid ? (servers[gid] || {}) : {};
 
-    const save = (next: PluginCfg) => { storage.cfg = next; };
-    const srv = guildId ? (cfg.servers[guildId] || {}) : {};
-    const patchSrv = (p: Partial<ServerCfg>) => {
-        const servers = { ...cfg.servers };
-        servers[guildId] = { ...servers[guildId], ...p };
-        save({ ...cfg, servers });
-        // Keep the floating button in sync: turning the feature on here also
-        // flips the native overlay switch (no-op on stock IPAs).
-        if (p.enabled === true) void ipcRequest("setEnabled", { enabled: true }, 3000);
-    };
+    let gname = "", cname = "", bname = "";
+    try {
+        const gl = guilds();
+        const g = gl.find(x => x.id === gid);
+        gname = g ? (g.name || gid) : (gid || "—");
+        if (g) {
+            const ch = textChannels(g.id).find(c => c.id === sc.channelId);
+            cname = ch ? `#${ch.name}` : (sc.channelId || "Not set");
+            const bt = botMembers(g.id).find(b => b.id === sc.botId);
+            bname = bt ? `@${bt.username || bt.globalName || bt.id}` : (sc.botId || "Not set");
+        }
+    } catch { /* stores unavailable */ }
 
-    const [, setTick] = useState(0);
-    useEffect(() => {
-        const t = setInterval(() => setTick(v => v + 1), 2500);
-        return () => clearInterval(t);
-    }, []);
-
-    const guildList = guilds();
-    const channelList = guildId ? textChannels(guildId) : [];
-    const botList = guildId ? botMembers(guildId) : [];
-
-    const selGuild = guildList.find((g: any) => g.id === guildId);
-    const selChannel = channelList.find((c: any) => c.id === srv.channelId);
-    const selBot = botList.find((b: any) => b.id === srv.botId);
-
-    if (!guildId || showGuilds) {
-        return <View style={{ padding: 16 }}>
-            <Stack spacing={12}>
-                <Text variant="text-md/semibold">Chat Auto</Text>
-                <Text variant="text-xs/medium" color="text-muted">Pick a server to configure auto-answering for the word games.</Text>
-                <ScrollView style={{ maxHeight: 420 }}>
-                    <Stack spacing={8}>
-                        {guildList.length === 0 && <Text variant="text-sm/medium" color="text-muted">No servers found.</Text>}
-                        {guildList.map((g: any) => (
-                            <Pressable key={g.id} onPress={() => { setGuildId(g.id); setShowGuilds(false); setShowChannels(false); setShowBots(false); }}>
-                                <Card style={{ padding: 12 }}>
-                                    <Text variant="text-sm/semibold">{g.name || "Unknown Server"}</Text>
-                                    <Text variant="text-xs/medium" color="text-muted">
-                                        {(g.approximateMemberCount || g.memberCount || 0).toLocaleString()} members
-                                        {cfg.servers[g.id]?.enabled ? "  •  ON" : ""}
-                                    </Text>
-                                </Card>
-                            </Pressable>
-                        ))}
-                    </Stack>
-                </ScrollView>
-            </Stack>
-        </View>;
-    }
-
-    return <View style={{ padding: 16 }}>
-        <Stack spacing={12}>
-            <Pressable onPress={() => setShowGuilds(true)}>
-                <Text variant="text-sm/medium" color="brand">← Servers</Text>
-            </Pressable>
-            <Text variant="text-md/semibold">{selGuild?.name || "Server"}</Text>
-
-            <TableRowGroup title="Chat Channel">
-                <TableRow
-                    label="Channel"
-                    subLabel={selChannel ? `#${selChannel.name}` : "Not set"}
-                    onPress={() => { setShowChannels(v => !v); setShowBots(false); }}
-                />
-            </TableRowGroup>
-            {showChannels && (
-                <ScrollView style={{ maxHeight: 240 }}>
-                    <Stack spacing={6}>
-                        {channelList.map((c: any) => (
-                            <Pressable key={c.id} onPress={() => { patchSrv({ channelId: c.id }); setShowChannels(false); }}>
-                                <Text variant="text-sm/medium" color={srv.channelId === c.id ? "brand" : "text-normal"}>#{c.name}</Text>
-                            </Pressable>
-                        ))}
-                        {!channelList.length && <Text variant="text-xs/medium" color="text-muted">No text channels found.</Text>}
-                    </Stack>
-                </ScrollView>
-            )}
-
-            <TableRowGroup title="Games Bot">
-                <TableRow
-                    label="Bot"
-                    subLabel={selBot ? `@${selBot.username || selBot.globalName || selBot.id}` : srv.botId ? srv.botId : "Not set"}
-                    onPress={() => { setShowBots(v => !v); setShowChannels(false); }}
-                />
-            </TableRowGroup>
-            {showBots && (
-                <ScrollView style={{ maxHeight: 240 }}>
-                    <Stack spacing={6}>
-                        {botList.map((b: any) => (
-                            <Pressable key={b.id} onPress={() => { patchSrv({ botId: b.id }); setShowBots(false); }}>
-                                <Text variant="text-sm/medium" color={srv.botId === b.id ? "brand" : "text-normal"}>@{b.username || b.globalName || b.id}</Text>
-                            </Pressable>
-                        ))}
-                        {!botList.length && <Text variant="text-xs/medium" color="text-muted">No bots found in the member list.</Text>}
-                    </Stack>
-                </ScrollView>
-            )}
-            <TextInput size="md" label="Or paste Bot ID" value={srv.botId || ""} placeholder="1234567890123456789"
-                onChange={(v: any) => patchSrv({ botId: typeof v === "string" ? v.trim() : String(v?.nativeEvent?.text ?? "").trim() })} />
-
-            <TableRowGroup title="Auto Answer">
-                <TableSwitchRow label="Enabled" subLabel={srv.channelId && srv.botId ? "Watches the channel and answers word games" : "Set channel and bot first"}
-                    value={!!srv.enabled && !!srv.channelId && !!srv.botId}
-                    onValueChange={(v: boolean) => {
-                        patchSrv({ enabled: v });
-                        if (v) void ipcRequest("setEnabled", { enabled: true }, 3000);
-                    }} />
-            </TableRowGroup>
-
-            <Text variant="text-sm/semibold">Speed</Text>
-            <TableRadioGroup title="Answer Speed" value={srv.speed === "insane" ? "insane" : "normal"} onChange={(v: string) => patchSrv({ speed: v === "insane" ? "insane" : "normal" })}>
-                <TableRadioRow label="Normal" subLabel="Verified answers" value="normal" />
-                <TableRadioRow label="Insane" subLabel="Fastest possible reply" value="insane" />
-            </TableRadioGroup>
-
+    return (
+        <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 16, gap: 12 }}>
+            <Text variant="text-md/semibold">Chat Auto</Text>
             <Card style={{ padding: 12 }}>
-                <Text variant="text-xs/medium" color="text-muted">
-                    The floating button (if shown) toggles answering on/off. It is hidden from screenshots and screen share.
+                <Text variant="text-sm/medium" color="text-muted">
+                    Control everything from the floating ⚡ button: a quick tap turns answering on/off — a long press opens the menu (server, channel, bot, speed).
                 </Text>
             </Card>
-
-            <TextInput size="md" label="OCR API Keys" value={state.ocrKeys || ""} placeholder="key1,key2,..."
-                onChange={(v: any) => { storage.ocrKeys = typeof v === "string" ? v : String(v?.nativeEvent?.text ?? ""); }} />
-        </Stack>
-    </View>;
+            <Card style={{ padding: 12 }}>
+                <Text variant="text-sm/medium">Server: {gname || "—"}</Text>
+                <Text variant="text-sm/medium">Channel: {cname || "—"}</Text>
+                <Text variant="text-sm/medium">Bot: {bname || "—"}</Text>
+                <Text variant="text-sm/medium">Speed: {sc.speed === "insane" ? "Insane" : "Normal"}</Text>
+            </Card>
+            <Text variant="text-sm/semibold">OCR API Keys</Text>
+            <RNTextInput
+                style={{
+                    backgroundColor: "#1e1f22",
+                    color: "#dcddde",
+                    borderRadius: 8,
+                    borderWidth: 1,
+                    borderColor: "#3f4147",
+                    paddingHorizontal: 12,
+                    paddingVertical: 10,
+                    minHeight: 44,
+                    fontSize: 14,
+                }}
+                placeholder="key1,key2,..."
+                placeholderTextColor="#949ba4"
+                multiline
+                autoCapitalize="none"
+                autoCorrect={false}
+                value={state.ocrKeys || ""}
+                onChangeText={(v: string) => { storage.ocrKeys = v; }}
+            />
+        </ScrollView>
+    );
 }

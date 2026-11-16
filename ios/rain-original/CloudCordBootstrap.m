@@ -2,6 +2,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
+#import <objc/runtime.h>
 #import <CommonCrypto/CommonDigest.h>
 #import "CloudCordRuntimeCache.h"
 #import "CloudCordRuntimeUpdate.h"
@@ -46,10 +47,75 @@ static void ChatAutoWriteJSON(NSString *name, NSDictionary *obj) {
 }
 @end
 
+// Full-window container owning the floating button and the settings panel.
+// Only touches inside the button or the (visible) panel card are delivered;
+// everything else falls through to Discord.
+@interface ChatAutoBox : UIView
+@property (nonatomic, weak) UIView *actionButton;
+@property (nonatomic, weak) UIView *settingsPanel;
+@end
+
+@implementation ChatAutoBox
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    if (self.actionButton && CGRectContainsPoint(self.actionButton.frame, point)) return YES;
+    if (self.settingsPanel && !self.settingsPanel.hidden &&
+        CGRectContainsPoint(self.settingsPanel.frame, point)) return YES;
+    return NO;
+}
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (self.settingsPanel && !self.settingsPanel.hidden) {
+        CGPoint pp = [self convertPoint:point toView:self.settingsPanel];
+        if ([self.settingsPanel pointInside:pp withEvent:event]) {
+            UIView *h = [self.settingsPanel hitTest:pp withEvent:event];
+            if (h) return h;
+        }
+    }
+    if (self.actionButton) {
+        CGPoint bp = [self convertPoint:point toView:self.actionButton];
+        if ([self.actionButton pointInside:bp withEvent:event]) {
+            UIView *h = [self.actionButton hitTest:bp withEvent:event];
+            if (h) return h;
+        }
+    }
+    return nil;
+}
+@end
+
+// ---------- Settings panel styling helpers ----------
+
+static UIColor *CAMuted(void) { return [UIColor colorWithWhite:0.72 alpha:1.0]; }
+static UIColor *CAFaint(void) { return [UIColor colorWithWhite:0.55 alpha:1.0]; }
+static UIColor *CAAccent(void) {
+    return [UIColor colorWithRed:88.0/255.0 green:101.0/255.0 blue:242.0/255.0 alpha:1.0];
+}
+static UIColor *CAGreen(void) {
+    return [UIColor colorWithRed:35.0/255.0 green:165.0/255.0 blue:90.0/255.0 alpha:1.0];
+}
+static UIColor *CARowHi(void) { return [UIColor colorWithWhite:1.0 alpha:0.08]; }
+static char kCAActionKey;
+static char kCABgKey;
+static char kCAValueKey;
+
 @interface ChatAutoOverlay : NSObject
 @property (nonatomic, strong) UIWindow *window;
 @property (nonatomic, strong) UIView *secureCanvas;
+@property (nonatomic, strong) ChatAutoBox *container;
 @property (nonatomic, strong) UIButton *button;
+@property (nonatomic, strong) UIView *panel;
+@property (nonatomic, strong) UIView *pageHost;
+@property (nonatomic, strong) NSArray *panelGuilds;
+@property (nonatomic, strong) NSDictionary *panelActive;
+@property (nonatomic, strong) NSDictionary *panelSaved;
+@property (nonatomic, copy) NSString *panelPage;
+@property (nonatomic, copy) NSString *selGuildId;
+@property (nonatomic, copy) NSString *selChannelId;
+@property (nonatomic, copy) NSString *selBotId;
+@property (nonatomic, copy) NSString *selSpeed;
+@property (nonatomic, strong) NSTimer *panelTimer;
+@property (nonatomic, strong) UITextField *botIDField;
+@property (nonatomic, strong) UILabel *vGuild, *vChannel, *vBot, *vSpeed;
+@property (nonatomic, strong) UISwitch *swEnabled;
+@property (nonatomic, assign) CGFloat panelHomeY;
 @property (nonatomic, assign) BOOL enabled;
 + (instancetype)shared;
 - (void)showIfNeeded;
@@ -104,6 +170,11 @@ static void ChatAutoWriteJSON(NSString *name, NSDictionary *obj) {
     [b addGestureRecognizer:pan];
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
         initWithTarget:self action:@selector(tapped:)];
+    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc]
+        initWithTarget:self action:@selector(longPressed:)];
+    lp.minimumPressDuration = 0.35;
+    [b addGestureRecognizer:lp];
+    [tap requireGestureRecognizerToFail:lp];
     [tap requireGestureRecognizerToFail:pan];
     [b addGestureRecognizer:tap];
     return b;
@@ -156,13 +227,23 @@ static void ChatAutoWriteJSON(NSString *name, NSDictionary *obj) {
             self.secureCanvas = canvas;
         }
     }
+    UIView *host = self.secureCanvas ?: self.window;
+    if (!self.container) {
+        self.container = [[ChatAutoBox alloc] initWithFrame:self.window.bounds];
+        self.container.backgroundColor = UIColor.clearColor;
+        self.container.autoresizingMask =
+            UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [host addSubview:self.container];
+    }
     if (!self.button) {
         self.button = [self makeButton];
         [self restorePosition];
-        UIView *host = self.secureCanvas ?: self.window;
-        [host addSubview:self.button];
-        ((ChatAutoWindow *)self.window).interactiveView = self.button;
+        [self.container addSubview:self.button];
+        [self ensurePanel];
     }
+    self.container.actionButton = self.button;
+    self.container.settingsPanel = self.panel;
+    ((ChatAutoWindow *)self.window).interactiveView = self.container;
     self.window.hidden = NO;
 }
 
@@ -198,6 +279,583 @@ static void ChatAutoWriteJSON(NSString *name, NSDictionary *obj) {
     if (self.button) [self applyEnabled:en to:self.button];
     ChatAutoWriteJSON(@"chatauto-state.json", @{
         @"enabled": @(en),
+        @"ts": @((long long)(NSDate.date.timeIntervalSince1970 * 1000))
+    });
+}
+
+// ---------- Settings panel (native menu on long-press) ----------
+
+- (void)longPressed:(UILongPressGestureRecognizer *)g {
+    if (g.state == UIGestureRecognizerStateBegan) [self togglePanel];
+}
+
+- (void)togglePanel {
+    if (self.panel && !self.panel.hidden) [self hidePanel];
+    else [self showPanel];
+}
+
+- (void)reloadOptions {
+    NSDictionary *o = ChatAutoReadJSON(@"chatauto-options.json");
+    self.panelGuilds = [o[@"guilds"] isKindOfClass:[NSArray class]] ? o[@"guilds"] : @[];
+    self.panelActive = [o[@"active"] isKindOfClass:[NSDictionary class]] ? o[@"active"] : @{};
+    self.panelSaved = [o[@"saved"] isKindOfClass:[NSDictionary class]] ? o[@"saved"] : @{};
+}
+
+- (void)ensurePanel {
+    if (self.panel) return;
+    CGFloat sw = CGRectGetWidth(self.window.bounds);
+    CGFloat sh = CGRectGetHeight(self.window.bounds);
+    CGFloat w = MIN(340, sw - 32);
+    CGFloat h = MIN(430, sh * 0.72);
+    CGFloat x = (sw - w) / 2.0;
+    CGFloat y = sh * 0.14;
+    self.panelHomeY = y;
+    self.panel = [[UIView alloc] initWithFrame:CGRectMake(x, y, w, h)];
+    self.panel.backgroundColor = [UIColor colorWithRed:0.09 green:0.095 blue:0.11 alpha:0.97];
+    self.panel.layer.cornerRadius = 14;
+    self.panel.layer.borderWidth = 0.5;
+    self.panel.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.10].CGColor;
+    self.panel.clipsToBounds = YES;
+    self.panel.hidden = YES;
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 0, w - 72, 50)];
+    title.text = @"Chat Auto";
+    title.font = [UIFont boldSystemFontOfSize:17];
+    title.textColor = UIColor.whiteColor;
+    title.userInteractionEnabled = NO;
+    [self.panel addSubview:title];
+    UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
+    close.frame = CGRectMake(w - 50, 9, 36, 32);
+    UIImage *xi = [UIImage systemImageNamed:@"xmark"];
+    if (xi) {
+        [close setImage:xi forState:UIControlStateNormal];
+        close.tintColor = CAMuted();
+        close.imageView.contentMode = UIViewContentModeScaleAspectFit;
+    } else {
+        [close setTitle:@"✕" forState:UIControlStateNormal];
+        [close setTitleColor:CAMuted() forState:UIControlStateNormal];
+        close.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightMedium];
+    }
+    [close addTarget:self action:@selector(hidePanel) forControlEvents:UIControlEventTouchUpInside];
+    [self.panel addSubview:close];
+    UIView *hair = [[UIView alloc] initWithFrame:CGRectMake(0, 50, w, 0.5)];
+    hair.backgroundColor = [UIColor colorWithWhite:1 alpha:0.08];
+    hair.userInteractionEnabled = NO;
+    [self.panel addSubview:hair];
+    self.pageHost = [[UIView alloc] initWithFrame:CGRectMake(0, 51, w, h - 51)];
+    self.pageHost.clipsToBounds = YES;
+    [self.panel addSubview:self.pageHost];
+    [self.container addSubview:self.panel];
+}
+
+- (void)showPanel {
+    [self ensurePanel];
+    [self reloadOptions];
+    if (!self.selGuildId.length && self.panelActive[@"guildId"]) {
+        self.selGuildId = [self.panelActive[@"guildId"] description];
+        self.selChannelId = [self.panelActive[@"channelId"] description] ?: @"";
+        self.selBotId = [self.panelActive[@"botId"] description] ?: @"";
+        NSString *sp = [self.panelActive[@"speed"] description];
+        self.selSpeed = sp.length ? sp : @"normal";
+    }
+    if (!self.selSpeed.length) self.selSpeed = @"normal";
+    self.panelPage = @"main";
+    [self showMainPage];
+    self.panel.transform = CGAffineTransformMakeScale(0.94, 0.94);
+    self.panel.hidden = NO;
+    self.panel.alpha = 0;
+    [UIView animateWithDuration:0.18 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+        self.panel.alpha = 1.0;
+        self.panel.transform = CGAffineTransformIdentity;
+    } completion:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+        selector:@selector(keyboardWillShowPanel:) name:UIKeyboardWillShowNotification object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+        selector:@selector(keyboardDidHidePanel) name:UIKeyboardWillHideNotification object:nil];
+    self.panelTimer = [NSTimer scheduledTimerWithTimeInterval:1.5 repeats:YES block:^(NSTimer *t) {
+        [self reloadOptions];
+        if ([self.panelPage isEqualToString:@"main"]) [self refreshMainValues];
+    }];
+}
+
+- (void)hidePanel {
+    if (self.panelTimer) { [self.panelTimer invalidate]; self.panelTimer = nil; }
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:UIKeyboardWillShowNotification object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:UIKeyboardWillHideNotification object:nil];
+    [self.botIDField resignFirstResponder];
+    [UIView animateWithDuration:0.15 animations:^{
+        self.panel.alpha = 0;
+    } completion:^(BOOL finished) {
+        self.panel.hidden = YES;
+        CGRect f = self.panel.frame;
+        f.origin.y = self.panelHomeY;
+        self.panel.frame = f;
+        self.panel.transform = CGAffineTransformIdentity;
+    }];
+}
+
+- (void)keyboardWillShowPanel:(NSNotification *)n {
+    CGRect kb = [n.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
+    CGFloat screenH = CGRectGetHeight(self.window.bounds);
+    CGFloat overlap = CGRectGetMaxY(self.panel.frame) - (screenH - kb.size.height);
+    if (overlap > 0) {
+        CGRect f = self.panel.frame;
+        f.origin.y -= (overlap + 10);
+        if (f.origin.y < 6) f.origin.y = 6;
+        [UIView animateWithDuration:0.25 animations:^{ self.panel.frame = f; }];
+    }
+}
+
+- (void)keyboardDidHidePanel {
+    CGRect f = self.panel.frame;
+    if (f.origin.y != self.panelHomeY) {
+        f.origin.y = self.panelHomeY;
+        [UIView animateWithDuration:0.2 animations:^{ self.panel.frame = f; }];
+    }
+}
+
+// ---------- Panel rows ----------
+
+- (UIControl *)baseRow:(CGRect)frame {
+    UIControl *row = [[UIControl alloc] initWithFrame:frame];
+    row.backgroundColor = UIColor.clearColor;
+    [row addTarget:self action:@selector(rowTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [row addTarget:self action:@selector(rowTouchDown:) forControlEvents:UIControlEventTouchDown];
+    [row addTarget:self action:@selector(rowTouchUp:) forControlEvents:
+        UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
+    return row;
+}
+
+- (void)rowTapped:(UIControl *)row {
+    void (^b)(void) = objc_getAssociatedObject(row, &kCAActionKey);
+    if (b) b();
+}
+
+- (void)rowTouchDown:(UIControl *)row { row.backgroundColor = CARowHi(); }
+
+- (void)rowTouchUp:(UIControl *)row {
+    row.backgroundColor = objc_getAssociatedObject(row, &kCABgKey) ?: UIColor.clearColor;
+}
+
+- (UIControl *)actionRow:(CGRect)frame title:(NSString *)title value:(NSString *)value
+                chevron:(BOOL)chev action:(void (^)(void))block {
+    UIControl *row = [self baseRow:frame];
+    objc_setAssociatedObject(row, &kCABgKey, UIColor.clearColor, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    CGFloat w = frame.size.width;
+    UILabel *tl = [[UILabel alloc] initWithFrame:CGRectMake(16, 0, w * 0.44, frame.size.height)];
+    tl.text = title;
+    tl.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    tl.textColor = UIColor.whiteColor;
+    tl.userInteractionEnabled = NO;
+    [row addSubview:tl];
+    CGFloat vx = w * 0.44;
+    CGFloat vw = w - vx - (chev ? 30 : 18);
+    UILabel *vl = [[UILabel alloc] initWithFrame:CGRectMake(vx, 0, vw, frame.size.height)];
+    vl.text = value.length ? value : @"Not set";
+    vl.font = [UIFont systemFontOfSize:14];
+    vl.textColor = value.length ? CAMuted() : CAFaint();
+    vl.textAlignment = NSTextAlignmentRight;
+    vl.lineBreakMode = NSLineBreakByTruncatingTail;
+    vl.adjustsFontSizeToFitWidth = YES;
+    vl.minimumScaleFactor = 0.65;
+    vl.userInteractionEnabled = NO;
+    [row addSubview:vl];
+    objc_setAssociatedObject(row, &kCAValueKey, vl, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (chev) {
+        UILabel *ch = [[UILabel alloc] initWithFrame:CGRectMake(w - 24, 0, 18, frame.size.height)];
+        ch.text = @"›";
+        ch.font = [UIFont systemFontOfSize:22 weight:UIFontWeightMedium];
+        ch.textColor = CAFaint();
+        ch.userInteractionEnabled = NO;
+        [row addSubview:ch];
+    }
+    objc_setAssociatedObject(row, &kCAActionKey, [block copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
+    return row;
+}
+
+- (UIControl *)enabledRow:(CGRect)frame {
+    UIControl *row = [self baseRow:frame];
+    objc_setAssociatedObject(row, &kCABgKey, UIColor.clearColor, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    CGFloat w = frame.size.width;
+    UILabel *tl = [[UILabel alloc] initWithFrame:CGRectMake(16, 0, w - 96, frame.size.height)];
+    tl.text = @"Enabled";
+    tl.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    tl.textColor = UIColor.whiteColor;
+    tl.userInteractionEnabled = NO;
+    [row addSubview:tl];
+    self.swEnabled = [[UISwitch alloc] initWithFrame:
+        CGRectMake(w - 70, (frame.size.height - 31) / 2.0, 51, 31)];
+    self.swEnabled.on = self.enabled;
+    self.swEnabled.onTintColor = CAGreen();
+    self.swEnabled.userInteractionEnabled = NO;
+    [row addSubview:self.swEnabled];
+    objc_setAssociatedObject(row, &kCAActionKey, ^{ [self toggleEnabledFromRow]; },
+                            OBJC_ASSOCIATION_COPY_NONATOMIC);
+    return row;
+}
+
+- (void)toggleEnabledFromRow {
+    [self setEnabled:!self.enabled];
+    if (self.swEnabled) self.swEnabled.on = self.enabled;
+    [self persistChoice];
+}
+
+- (UIControl *)optionRow:(CGRect)frame title:(NSString *)title selected:(BOOL)sel
+                  action:(void (^)(void))block {
+    UIControl *row = [self baseRow:frame];
+    UIColor *bg = sel
+        ? [UIColor colorWithRed:88.0/255.0 green:101.0/255.0 blue:242.0/255.0 alpha:0.22]
+        : [UIColor colorWithWhite:1 alpha:0.05];
+    row.backgroundColor = bg;
+    row.layer.cornerRadius = 8;
+    row.clipsToBounds = YES;
+    objc_setAssociatedObject(row, &kCABgKey, bg, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    CGFloat w = frame.size.width;
+    UILabel *tl = [[UILabel alloc] initWithFrame:CGRectMake(14, 0, w - 44, frame.size.height)];
+    tl.text = title;
+    tl.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    tl.textColor = sel ? CAAccent() : UIColor.whiteColor;
+    tl.lineBreakMode = NSLineBreakByTruncatingTail;
+    tl.userInteractionEnabled = NO;
+    [row addSubview:tl];
+    if (sel) {
+        UILabel *ck = [[UILabel alloc] initWithFrame:CGRectMake(w - 34, 0, 24, frame.size.height)];
+        ck.text = @"✓";
+        ck.font = [UIFont boldSystemFontOfSize:16];
+        ck.textColor = CAAccent();
+        ck.textAlignment = NSTextAlignmentRight;
+        ck.userInteractionEnabled = NO;
+        [row addSubview:ck];
+    }
+    objc_setAssociatedObject(row, &kCAActionKey, [block copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
+    return row;
+}
+
+// ---------- Panel pages ----------
+
+- (void)clearPage {
+    for (UIView *v in [self.pageHost.subviews copy]) [v removeFromSuperview];
+}
+
+- (void)backToMain {
+    [self.botIDField resignFirstResponder];
+    [self showMainPage];
+}
+
+- (NSDictionary *)guildEntry:(NSString *)gid {
+    if (!gid.length) return nil;
+    for (NSDictionary *g in self.panelGuilds) {
+        if ([g isKindOfClass:[NSDictionary class]] && [g[@"id"] isEqualToString:gid]) return g;
+    }
+    return nil;
+}
+
+- (NSString *)guildNameForId:(NSString *)gid {
+    NSDictionary *g = [self guildEntry:gid];
+    if (g && [g[@"name"] length]) return g[@"name"];
+    if (self.panelActive && [self.panelActive[@"guildId"] isEqualToString:gid] &&
+        [self.panelActive[@"guildName"] length]) return self.panelActive[@"guildName"];
+    return gid.length ? gid : @"Not set";
+}
+
+- (NSString *)channelNameForId:(NSString *)cid {
+    if (!cid.length) return @"Not set";
+    NSDictionary *g = [self guildEntry:self.selGuildId];
+    id chs = g ? g[@"channels"] : nil;
+    if ([chs isKindOfClass:[NSArray class]]) {
+        for (NSDictionary *c in chs) {
+            if ([c isKindOfClass:[NSDictionary class]] && [c[@"id"] isEqualToString:cid] && [c[@"name"] length])
+                return [NSString stringWithFormat:@"#%@", c[@"name"]];
+        }
+    }
+    if (self.panelActive && [self.panelActive[@"guildId"] isEqualToString:self.selGuildId] &&
+        [self.panelActive[@"channelId"] isEqualToString:cid] &&
+        [self.panelActive[@"channelName"] length])
+        return [NSString stringWithFormat:@"#%@", self.panelActive[@"channelName"]];
+    return cid;
+}
+
+- (NSString *)botNameForId:(NSString *)bid {
+    if (!bid.length) return @"Not set";
+    NSDictionary *g = [self guildEntry:self.selGuildId];
+    id bots = g ? g[@"bots"] : nil;
+    if ([bots isKindOfClass:[NSArray class]]) {
+        for (NSDictionary *b in bots) {
+            if ([b isKindOfClass:[NSDictionary class]] && [b[@"id"] isEqualToString:bid]) {
+                NSString *n = [b[@"name"] description];
+                return n.length ? [NSString stringWithFormat:@"@%@", n] : bid;
+            }
+        }
+    }
+    if (self.panelActive && [self.panelActive[@"guildId"] isEqualToString:self.selGuildId] &&
+        [self.panelActive[@"botId"] isEqualToString:bid] &&
+        [self.panelActive[@"botName"] length])
+        return [NSString stringWithFormat:@"@%@", self.panelActive[@"botName"]];
+    return bid;
+}
+
+- (NSString *)displayGuildName {
+    return self.selGuildId.length ? [self guildNameForId:self.selGuildId] : @"Not set";
+}
+- (NSString *)displayChannelName {
+    return self.selChannelId.length ? [self channelNameForId:self.selChannelId] : @"Not set";
+}
+- (NSString *)displayBotName {
+    return self.selBotId.length ? [self botNameForId:self.selBotId] : @"Not set";
+}
+- (NSString *)displaySpeedName {
+    return [self.selSpeed isEqualToString:@"insane"] ? @"Insane" : @"Normal";
+}
+
+- (void)refreshMainValues {
+    if (self.vGuild) self.vGuild.text = [self displayGuildName];
+    if (self.vChannel) self.vChannel.text = [self displayChannelName];
+    if (self.vBot) self.vBot.text = [self displayBotName];
+    if (self.vSpeed) self.vSpeed.text = [self displaySpeedName];
+    if (self.swEnabled) self.swEnabled.on = self.enabled;
+}
+
+- (void)showMainPage {
+    [self clearPage];
+    self.panelPage = @"main";
+    CGFloat w = self.pageHost.bounds.size.width;
+    CGFloat H = self.pageHost.bounds.size.height;
+    __weak typeof(self) ws = self;
+    CGFloat y = 8, rh = 46;
+    UIControl *r;
+    r = [self actionRow:CGRectMake(0, y, w, rh) title:@"Server" value:[self displayGuildName]
+               chevron:YES action:^{ [ws showGuildPage]; }];
+    self.vGuild = objc_getAssociatedObject(r, &kCAValueKey);
+    [self.pageHost addSubview:r]; y += rh + 2;
+    r = [self actionRow:CGRectMake(0, y, w, rh) title:@"Channel" value:[self displayChannelName]
+               chevron:YES action:^{ [ws showChannelPage]; }];
+    self.vChannel = objc_getAssociatedObject(r, &kCAValueKey);
+    [self.pageHost addSubview:r]; y += rh + 2;
+    r = [self actionRow:CGRectMake(0, y, w, rh) title:@"Bot" value:[self displayBotName]
+               chevron:YES action:^{ [ws showBotPage]; }];
+    self.vBot = objc_getAssociatedObject(r, &kCAValueKey);
+    [self.pageHost addSubview:r]; y += rh + 2;
+    r = [self actionRow:CGRectMake(0, y, w, rh) title:@"Speed" value:[self displaySpeedName]
+               chevron:YES action:^{ [ws showSpeedPage]; }];
+    self.vSpeed = objc_getAssociatedObject(r, &kCAValueKey);
+    [self.pageHost addSubview:r]; y += rh + 12;
+    [self.pageHost addSubview:[self enabledRow:CGRectMake(0, y, w, rh)]];
+    UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(16, H - 36, w - 32, 30)];
+    hint.text = @"Tap = on/off   •   Hold = this menu";
+    hint.font = [UIFont systemFontOfSize:11];
+    hint.textColor = CAFaint();
+    hint.textAlignment = NSTextAlignmentCenter;
+    hint.userInteractionEnabled = NO;
+    [self.pageHost addSubview:hint];
+    [self refreshMainValues];
+}
+
+- (NSString *)emptyTextForKind:(NSString *)kind {
+    if ([kind isEqualToString:@"guild"]) return @"No servers found — join a server first.";
+    if ([kind isEqualToString:@"channel"]) return @"No channels — open the server in Discord first.";
+    if ([kind isEqualToString:@"bot"]) return @"No bots found — paste the Bot ID below.";
+    return @"Nothing here.";
+}
+
+- (void)showPickPage:(NSString *)kind title:(NSString *)title
+               items:(NSArray *)items selected:(NSString *)sel
+          allowBotID:(BOOL)allowBotID {
+    [self clearPage];
+    self.panelPage = kind;
+    CGFloat w = self.pageHost.bounds.size.width;
+    CGFloat H = self.pageHost.bounds.size.height;
+    __weak typeof(self) ws = self;
+    UIButton *back = [UIButton buttonWithType:UIButtonTypeSystem];
+    back.frame = CGRectMake(6, 4, 96, 32);
+    [back setTitle:@"‹ Back" forState:UIControlStateNormal];
+    [back setTitleColor:CAAccent() forState:UIControlStateNormal];
+    back.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    [back addTarget:self action:@selector(backToMain) forControlEvents:UIControlEventTouchUpInside];
+    [self.pageHost addSubview:back];
+    UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(14, 34, w - 28, 24)];
+    t.text = title;
+    t.font = [UIFont boldSystemFontOfSize:16];
+    t.textColor = UIColor.whiteColor;
+    t.userInteractionEnabled = NO;
+    [self.pageHost addSubview:t];
+    CGFloat listH = H - 68 - (allowBotID ? 74 : 0);
+    UIScrollView *sv = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 62, w, listH)];
+    sv.alwaysBounceVertical = YES;
+    sv.showsVerticalScrollIndicator = YES;
+    if (items.count) {
+        CGFloat iy = 4;
+        for (NSDictionary *it in items) {
+            if (![it isKindOfClass:[NSDictionary class]]) continue;
+            NSString *iid = [it[@"id"] description];
+            NSString *iname = [it[@"title"] description] ?: iid;
+            if (!iid.length) continue;
+            UIControl *row = [self optionRow:CGRectMake(10, iy, w - 20, 42)
+                                       title:iname selected:[iid isEqualToString:sel]
+                                      action:^{ [ws pickOption:kind withId:iid]; }];
+            [sv addSubview:row];
+            iy += 44;
+        }
+        sv.contentSize = CGSizeMake(w, iy + 8);
+    } else {
+        UILabel *emp = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, w - 32, 60)];
+        emp.text = [self emptyTextForKind:kind];
+        emp.font = [UIFont systemFontOfSize:13];
+        emp.textColor = CAFaint();
+        emp.numberOfLines = 3;
+        emp.textAlignment = NSTextAlignmentCenter;
+        emp.userInteractionEnabled = NO;
+        [sv addSubview:emp];
+        sv.contentSize = CGSizeMake(w, listH);
+    }
+    [self.pageHost addSubview:sv];
+    if (allowBotID) {
+        CGFloat by = H - 70;
+        UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, by, w, 70)];
+        bar.backgroundColor = [UIColor colorWithWhite:1 alpha:0.04];
+        self.botIDField = [[UITextField alloc] initWithFrame:CGRectMake(12, 8, w - 118, 36)];
+        self.botIDField.placeholder = @"Or paste Bot ID";
+        self.botIDField.font = [UIFont systemFontOfSize:14];
+        self.botIDField.textColor = UIColor.whiteColor;
+        self.botIDField.backgroundColor = [UIColor colorWithWhite:1 alpha:0.08];
+        self.botIDField.layer.cornerRadius = 8;
+        self.botIDField.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 10, 36)];
+        self.botIDField.leftViewMode = UITextFieldViewModeAlways;
+        self.botIDField.keyboardType = UIKeyboardTypeNumberPad;
+        self.botIDField.autocorrectionType = UITextAutocorrectionTypeNo;
+        self.botIDField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        UIToolbar *kb = [[UIToolbar alloc] initWithFrame:CGRectMake(0, 0, w, 44)];
+        kb.barStyle = UIBarStyleDefault;
+        kb.translucent = YES;
+        UIBarButtonItem *flex = [[UIBarButtonItem alloc]
+            initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil];
+        UIBarButtonItem *done = [[UIBarButtonItem alloc] initWithTitle:@"Done"
+            style:UIBarButtonItemStyleDone target:self action:@selector(dismissKeyboard)];
+        [done setTitleTextAttributes:@{NSForegroundColorAttributeName: CAAccent()}
+                           forState:UIControlStateNormal];
+        kb.items = @[flex, done];
+        self.botIDField.inputAccessoryView = kb;
+        [bar addSubview:self.botIDField];
+        UIButton *setB = [UIButton buttonWithType:UIButtonTypeSystem];
+        setB.frame = CGRectMake(w - 102, 8, 90, 36);
+        [setB setTitle:@"Set" forState:UIControlStateNormal];
+        [setB setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        setB.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+        setB.backgroundColor = CAAccent();
+        setB.layer.cornerRadius = 8;
+        [setB addTarget:self action:@selector(botIDSet:) forControlEvents:UIControlEventTouchUpInside];
+        [bar addSubview:setB];
+        [self.pageHost addSubview:bar];
+    }
+}
+
+- (void)dismissKeyboard { [self.botIDField resignFirstResponder]; }
+
+- (void)botIDSet:(id)sender {
+    NSString *v = [self.botIDField.text
+        stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (v.length) {
+        self.selBotId = v;
+        [self persistChoice];
+        [self.botIDField resignFirstResponder];
+        [self showMainPage];
+    }
+}
+
+- (void)showGuildPage {
+    NSMutableArray *items = [NSMutableArray array];
+    for (NSDictionary *g in self.panelGuilds) {
+        if (![g isKindOfClass:[NSDictionary class]]) continue;
+        NSString *gid = [g[@"id"] description];
+        if (!gid.length) continue;
+        [items addObject:@{@"id": gid, @"title": [g[@"name"] description] ?: @"Server"}];
+    }
+    [self showPickPage:@"guild" title:@"Select Server" items:items
+              selected:self.selGuildId allowBotID:NO];
+}
+
+- (void)showChannelPage {
+    NSMutableArray *items = [NSMutableArray array];
+    NSDictionary *g = [self guildEntry:self.selGuildId];
+    id chs = g ? g[@"channels"] : nil;
+    if ([chs isKindOfClass:[NSArray class]]) {
+        for (NSDictionary *c in chs) {
+            if (![c isKindOfClass:[NSDictionary class]]) continue;
+            NSString *cid = [c[@"id"] description];
+            if (!cid.length) continue;
+            NSString *cn = [c[@"name"] description] ?: cid;
+            [items addObject:@{@"id": cid, @"title": [NSString stringWithFormat:@"#%@", cn]}];
+        }
+    }
+    [self showPickPage:@"channel" title:@"Select Channel" items:items
+              selected:self.selChannelId allowBotID:NO];
+}
+
+- (void)showBotPage {
+    NSMutableArray *items = [NSMutableArray array];
+    NSDictionary *g = [self guildEntry:self.selGuildId];
+    id bots = g ? g[@"bots"] : nil;
+    if ([bots isKindOfClass:[NSArray class]]) {
+        for (NSDictionary *b in bots) {
+            if (![b isKindOfClass:[NSDictionary class]]) continue;
+            NSString *bid = [b[@"id"] description];
+            if (!bid.length) continue;
+            NSString *bn = [b[@"name"] description] ?: bid;
+            [items addObject:@{@"id": bid, @"title": [NSString stringWithFormat:@"@%@", bn]}];
+        }
+    }
+    [self showPickPage:@"bot" title:@"Select Games Bot" items:items
+              selected:self.selBotId allowBotID:YES];
+}
+
+- (void)showSpeedPage {
+    NSArray *items = @[
+        @{@"id": @"normal", @"title": @"Normal — verified answers"},
+        @{@"id": @"insane", @"title": @"Insane — fastest reply"},
+    ];
+    [self showPickPage:@"speed" title:@"Answer Speed" items:items
+              selected:self.selSpeed allowBotID:NO];
+}
+
+- (void)pickOption:(NSString *)kind withId:(NSString *)oid {
+    if (!oid.length) return;
+    if ([kind isEqualToString:@"guild"]) {
+        self.selGuildId = oid;
+        NSDictionary *sv = [self.panelSaved isKindOfClass:[NSDictionary class]] ? self.panelSaved[oid] : nil;
+        if (![sv isKindOfClass:[NSDictionary class]]) sv = nil;
+        NSString *sc = [sv[@"channelId"] description];
+        NSString *sb = [sv[@"botId"] description];
+        NSString *ss = [sv[@"speed"] description];
+        if (self.panelActive && [self.panelActive[@"guildId"] isEqualToString:oid]) {
+            if (!sc.length) sc = [self.panelActive[@"channelId"] description];
+            if (!sb.length) sb = [self.panelActive[@"botId"] description];
+            if (!ss.length) ss = [self.panelActive[@"speed"] description];
+        }
+        self.selChannelId = sc.length ? sc : @"";
+        self.selBotId = sb.length ? sb : @"";
+        self.selSpeed = ss.length ? ss : @"normal";
+        [self persistChoice];
+        [self showMainPage];
+    } else if ([kind isEqualToString:@"channel"]) {
+        self.selChannelId = oid;
+        [self persistChoice];
+        [self showMainPage];
+    } else if ([kind isEqualToString:@"bot"]) {
+        self.selBotId = oid;
+        [self persistChoice];
+        [self showMainPage];
+    } else if ([kind isEqualToString:@"speed"]) {
+        self.selSpeed = oid;
+        [self persistChoice];
+        [self showMainPage];
+    }
+}
+
+- (void)persistChoice {
+    ChatAutoWriteJSON(@"chatauto-choice.json", @{
+        @"guildId": self.selGuildId ?: @"",
+        @"channelId": self.selChannelId ?: @"",
+        @"botId": self.selBotId ?: @"",
+        @"speed": self.selSpeed.length ? self.selSpeed : @"normal",
+        @"enabled": @(self.enabled),
         @"ts": @((long long)(NSDate.date.timeIntervalSince1970 * 1000))
     });
 }
