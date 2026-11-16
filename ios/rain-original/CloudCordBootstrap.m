@@ -213,11 +213,18 @@ static NSString *CAKBNorm(NSString *s) {
         }
     }
     if (!k) return;
-    UIColor *hi = [UIColor colorWithWhite:1 alpha:0.38];
-    k.backgroundColor = hi;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.11 * NSEC_PER_SEC)),
+    UIColor *hi = [UIColor colorWithWhite:1 alpha:0.45];
+    UIColor *keyBg = [UIColor colorWithWhite:1 alpha:0.13];
+    [UIView animateWithDuration:0.05 animations:^{
+        k.backgroundColor = hi;
+        k.transform = CGAffineTransformMakeScale(0.88, 0.88);
+    }];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.09 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        k.backgroundColor = [UIColor colorWithWhite:1 alpha:0.13];
+        [UIView animateWithDuration:0.09 animations:^{
+            k.backgroundColor = keyBg;
+            k.transform = CGAffineTransformIdentity;
+        }];
     });
 }
 
@@ -1151,12 +1158,12 @@ static void ChatAutoHandleType(NSDictionary *req) {
         return;
     }
     BOOL insane = [[req[@"speed"] description] isEqualToString:@"insane"];
-    double base = insane ? 0.005 : 0.030;
-    double jit = insane ? 0.012 : 0.050;
+    double base = insane ? 0.003 : 0.016;
+    double jit = insane ? 0.007 : 0.032;
     ChatAutoOverlay *ov = [ChatAutoOverlay shared];
     [ov showKeyboard];
     // Let the keyboard start rising, then type through real input events.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.40 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.28 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         ChatAutoTypeStep(tv, clusters, 0, base, jit, resId, YES);
     });
@@ -1184,11 +1191,11 @@ static void ChatAutoHandleAnimate(NSDictionary *req) {
         return;
     }
     BOOL insane = [[req[@"speed"] description] isEqualToString:@"insane"];
-    double base = insane ? 0.005 : 0.030;
-    double jit = insane ? 0.012 : 0.050;
+    double base = insane ? 0.003 : 0.016;
+    double jit = insane ? 0.007 : 0.032;
     ChatAutoOverlay *ov = [ChatAutoOverlay shared];
     [ov showKeyboard];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.40 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.28 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         ChatAutoTypeStep(nil, clusters, 0, base, jit, resId, NO);
     });

@@ -1,4 +1,5 @@
 import { defineCorePlugin } from "..";
+import { AR_WORDS_BLOB } from "./ar-words";
 import { useProxy } from "@core/vendetta/storage";
 import { awaitStorage, createStorage } from "@lib/api/storage";
 import { intercept } from "@lib/api/flux";
@@ -66,6 +67,87 @@ const CHAT_ANSWER_BAD = new Set([
 ].map(arNorm));
 
 const COUNTDOWN_RE = /لديك|ثانيه|ثواني|متبقي|الوقت/;
+
+// ---------- Arabic dictionary: validate + repair OCR answers ----------
+// norm -> raw display form (first = most frequent). Built once at startup.
+const DICT = new Map<string, string>();
+try {
+    for (const w of AR_WORDS_BLOB.split(" ")) {
+        if (!w) continue;
+        const n = arNorm(w);
+        if (n.length >= 2 && !DICT.has(n)) DICT.set(n, w);
+    }
+} catch { /* dictionary optional */ }
+
+// OCR-confusable letter groups in normalized space. A swap is only accepted
+// when the result is a real dictionary word, so wrong guesses can't slip in.
+const CONFUSE: Record<string, string> = {};
+for (const g of [["ق", "ف"], ["ت", "ث"], ["س", "ش"], ["ض", "ص"], ["ط", "ظ"],
+                 ["ج", "ح"], ["د", "ذ"], ["ز", "ر"], ["ب", "ن"]]) {
+    for (const c of g) CONFUSE[c] = (CONFUSE[c] || "") + g.filter(x => x !== c).join("");
+}
+
+// Returns the dictionary display form for a normalized word, or null.
+// Tries exact match, then 1/2/3 letter confusable swaps (short words only
+// beyond the first pass) — every candidate must exist in DICT.
+function dictFix(n: string): string | null {
+    const exact = DICT.get(n);
+    if (exact) return exact;
+    const L = n.length;
+    if (L < 2 || L > 16) return null;
+    const altsAt = (i: number) => CONFUSE[n[i]] || "";
+    // single swap
+    for (let i = 0; i < L; i++) {
+        for (const a of altsAt(i)) {
+            const v = n.slice(0, i) + a + n.slice(i + 1);
+            const hit = DICT.get(v);
+            if (hit) return hit;
+        }
+    }
+    // two swaps — only for short words to bound the search
+    if (L <= 7) {
+        for (let i = 0; i < L; i++) for (let j = i + 1; j < L; j++) {
+            for (const a of altsAt(i)) for (const b of altsAt(j)) {
+                const v = n.slice(0, i) + a + n.slice(i + 1, j) + b + n.slice(j + 1);
+                const hit = DICT.get(v);
+                if (hit) return hit;
+            }
+        }
+    }
+    // three swaps — very short words only
+    if (L <= 4) {
+        for (let i = 0; i < L; i++) for (let j = i + 1; j < L; j++) for (let k = j + 1; k < L; k++) {
+            for (const a of altsAt(i)) for (const b of altsAt(j)) for (const c of altsAt(k)) {
+                const v = n.slice(0, i) + a + n.slice(i + 1, j) + b + n.slice(j + 1, k) + c + n.slice(k + 1);
+                const hit = DICT.get(v);
+                if (hit) return hit;
+            }
+        }
+    }
+    return null;
+}
+
+// Validate + repair a candidate's display text against the dictionary.
+// ok=true means every word resolved (exact or repaired); send is what to type.
+function dictValidate(disp: string, mode: "fast" | "tafkeek" | null): { ok: boolean; send: string } {
+    if (mode === "tafkeek") {
+        const joined = disp.replace(/\s+/g, "");
+        if (joined.length < 2) return { ok: false, send: disp };
+        const fixed = dictFix(arNorm(joined));
+        return fixed ? { ok: true, send: fixed } : { ok: false, send: disp };
+    }
+    const words = disp.split(/\s+/).filter(Boolean);
+    if (!words.length) return { ok: false, send: disp };
+    let allOk = true;
+    const out = words.map(w => {
+        const n = arNorm(w);
+        const hit = DICT.get(n) || dictFix(n);
+        if (hit) return hit;
+        allOk = false;
+        return w;
+    });
+    return { ok: allOk, send: out.join(" ") };
+}
 
 interface OcrWord { WordText?: string; Left?: number; Top?: number; Height?: number; Width?: number; }
 interface OcrLine { Words?: OcrWord[]; MinTop?: number; }
@@ -165,7 +247,7 @@ function parseOcrResult(json: OcrResultJson | null): OcrResult {
         else rows.push({ top: w.tp, words: [w] });
     }
 
-    interface Cand { key: string; disp: string; score: number; }
+    interface Cand { key: string; disp: string; score: number; dictOk: boolean; }
     const cands: Cand[] = [];
     const letterRows: OcrWordGeo[][] = [];
 
@@ -186,12 +268,14 @@ function parseOcrResult(json: OcrResultJson | null): OcrResult {
         });
         if (!kept.length) continue;
         const ordered = kept.slice().sort((a, b) => b.l - a.l);
-        const disp = ordered.map(w => w.t).join(" ");
-        const key = arNorm(disp);
+        const rawDisp = ordered.map(w => w.t).join(" ");
+        const dv = dictValidate(rawDisp, res.mode);
+        const key = arNorm(dv.send);
         if (key.length < 2) continue;
         const avgH = kept.reduce((s, w) => s + w.h, 0) / kept.length;
-        const chars = disp.replace(/\s/g, "").length;
-        cands.push({ key, disp, score: kept.length * 15 + avgH * 2 + chars * 2 });
+        const chars = dv.send.replace(/\s/g, "").length;
+        cands.push({ key, disp: dv.send, dictOk: dv.ok,
+                     score: kept.length * 15 + avgH * 2 + chars * 2 + (dv.ok ? 1000 : 0) });
         const singles = kept.filter(w => w.n.length <= 1).length;
         if (kept.length >= 2 && singles / kept.length >= 0.6) letterRows.push(kept);
     }
@@ -200,9 +284,13 @@ function parseOcrResult(json: OcrResultJson | null): OcrResult {
     // merge every letter-heavy row into one candidate in reading order.
     if (res.mode === "tafkeek" && letterRows.length) {
         const all = letterRows.flat().sort((a, b) => a.tp - b.tp || b.l - a.l);
-        const disp = all.map(w => w.t).join(" ");
-        const key = arNorm(disp);
-        if (key.length >= 2) cands.push({ key, disp, score: all.length * 30 + 60 });
+        const rawDisp = all.map(w => w.t).join(" ");
+        const dv = dictValidate(rawDisp, "tafkeek");
+        const key = arNorm(dv.send);
+        if (key.length >= 2) {
+            cands.push({ key, disp: dv.send, dictOk: dv.ok,
+                         score: all.length * 30 + 60 + (dv.ok ? 1000 : 0) });
+        }
     }
 
     if (cands.length) {
