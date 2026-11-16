@@ -64,6 +64,7 @@ const CHAT_STOP = new Set([
 const CHAT_ANSWER_BAD = new Set([
     "اسرع", "يكتب", "كتابه", "تفكيك", "فكك", "لديك", "ثانيه", "ثواني", "متبقي",
     "جاوب", "الكلمه", "كلمه", "سريعه", "بسرعه", "الجواب", "نقاط", "جولة",
+    "العاب", "اللاعاب", "اللاعبه", "مرحبا", "هلا", "اهلا", "كلمه السر",
 ].map(arNorm));
 
 const COUNTDOWN_RE = /لديك|ثانيه|ثواني|متبقي|الوقت/;
@@ -202,6 +203,8 @@ function isUiRow(jn: string, js: string): boolean {
     if (/تفكيك|فكك/.test(jn)) return true;
     if (/اسرع/.test(jn) && /يكتب/.test(jn)) return true;
     if (COUNTDOWN_RE.test(js) || /\d+\s*(ثانيه|ثواني)/.test(js)) return true;
+    // Branding/games-label rows — "ألعاب", "ألعاب فريدة", greetings etc.
+    if (/^العاب|اللاعاب|اللاعبه|^مرحبا|^هلا|^اهلا/.test(jn)) return true;
     return false;
 }
 
@@ -247,6 +250,17 @@ function parseOcrResult(json: OcrResultJson | null): OcrResult {
         else rows.push({ top: w.tp, words: [w] });
     }
 
+    // Positional anchor: the game-type label (تفكيك / اسرع يكتب) sits above the
+    // answer in every layout of these games — anything ABOVE it is title,
+    // branding or decoration and can never be the answer.
+    let modeTop = Infinity;
+    for (const row of rows) {
+        const jn = row.words.map(w => w.n).join("");
+        if (/تفكيك|فكك/.test(jn) || (/اسرع/.test(jn) && /يكتب/.test(jn))) {
+            modeTop = Math.min(modeTop, row.top);
+        }
+    }
+
     interface Cand { key: string; disp: string; score: number; dictOk: boolean; }
     const cands: Cand[] = [];
     const letterRows: OcrWordGeo[][] = [];
@@ -267,6 +281,12 @@ function parseOcrResult(json: OcrResultJson | null): OcrResult {
             return true;
         });
         if (!kept.length) continue;
+        // Letter-heavy rows feed the tafkeek grid merge from ANY position —
+        // the letters are the answer wherever they sit on the image.
+        const singles = kept.filter(w => w.n.length <= 1).length;
+        if (kept.length >= 2 && singles / kept.length >= 0.6) letterRows.push(kept);
+        // Word candidates only at/below the mode label — above it is chrome.
+        if (row.top < modeTop - tol) continue;
         const ordered = kept.slice().sort((a, b) => b.l - a.l);
         const rawDisp = ordered.map(w => w.t).join(" ");
         const dv = dictValidate(rawDisp, res.mode);
@@ -276,8 +296,6 @@ function parseOcrResult(json: OcrResultJson | null): OcrResult {
         const chars = dv.send.replace(/\s/g, "").length;
         cands.push({ key, disp: dv.send, dictOk: dv.ok,
                      score: kept.length * 15 + avgH * 2 + chars * 2 + (dv.ok ? 1000 : 0) });
-        const singles = kept.filter(w => w.n.length <= 1).length;
-        if (kept.length >= 2 && singles / kept.length >= 0.6) letterRows.push(kept);
     }
 
     // tafkeek: letters may be laid out in a grid across several rows —
@@ -288,8 +306,10 @@ function parseOcrResult(json: OcrResultJson | null): OcrResult {
         const dv = dictValidate(rawDisp, "tafkeek");
         const key = arNorm(dv.send);
         if (key.length >= 2) {
+            // tafkeek answers ARE letters — a letter-grid candidate outranks
+            // every word-row candidate (titles/branding can't compete).
             cands.push({ key, disp: dv.send, dictOk: dv.ok,
-                         score: all.length * 30 + 60 + (dv.ok ? 1000 : 0) });
+                         score: all.length * 30 + 60 + (dv.ok ? 1000 : 0) + 5000 });
         }
     }
 
